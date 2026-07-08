@@ -1,29 +1,39 @@
 #include <array>
 #include <codotaku_utils.hpp>
+#include <codotaku_window_context.hpp>
+#include <functional> // For std::move_only_function
 #include <memory_resource>
 #include <span>
 
 #include "SDL3/SDL_render.h"
 #include "SDL3_ttf/SDL_ttf.h"
+#include "codotaku_style_builder.hpp"
 #include "yoga/YGConfig.h"
 #include "yoga/YGNode.h"
 #include "yoga/YGNodeLayout.h"
-#include "yoga/YGNodeStyle.h"
-#include "yoga/YGValue.h"
+
 
 struct Widget {
-    SDL_FColor color;
-    TTF_Text *text;
+    enum class Type {
+        Container,
+        Text
+    };
+
+    Type type = Type::Container;
+    SDL_FColor color{0.0f, 0.0f, 0.0f, 0.0f};
+    TTF_Text *text = nullptr;
+    bool hovered = false;
+    bool interactive = false;
+    std::move_only_function<void()> onClick = nullptr;
 };
 
 static YGSize MeasureTextNode(YGNodeConstRef node, float width, YGMeasureMode widthMode, float height,
                               YGMeasureMode heightMode) {
     if (const auto *widget = static_cast<const Widget *>(YGNodeGetContext(node)); widget && widget->text) {
-        // If Yoga tells us a target maximum layout width, pass it down to wrap the text
         if (widthMode != YGMeasureModeUndefined) {
             chk(TTF_SetTextWrapWidth(widget->text, static_cast<int>(width)));
         } else {
-            chk(TTF_SetTextWrapWidth(widget->text, 0)); // No wrapping
+            chk(TTF_SetTextWrapWidth(widget->text, 0));
         }
 
         int textW = 0, textH = 0;
@@ -36,134 +46,182 @@ static YGSize MeasureTextNode(YGNodeConstRef node, float width, YGMeasureMode wi
 
 class App {
 public:
-    explicit App(std::span<char *> args) {
-        chk(SDL_SetAppMetadata("Codotaku Demo", "1.0", "com.codotaku.demo"));
-        chk(SDL_Init(SDL_INIT_VIDEO));
-        chk(TTF_Init());
-
-        chk(SDL_CreateWindowAndRenderer("Codotaku Demo", 800, 600, SDL_WINDOW_RESIZABLE | SDL_WINDOW_HIDDEN, &window_,
-                                        &renderer_));
-        chk(SDL_SetRenderDrawBlendMode(renderer_, SDL_BLENDMODE_BLEND));
-        textEngine_ = TTF_CreateRendererTextEngine(renderer_);
-
-        chk(SDL_GetWindowSize(window_, &windowWidth, &windowHeight));
-        const auto pixelsInPoint = chk(SDL_GetWindowDisplayScale(window_));
-
+    explicit App(std::span<char *> args)
+        : ctx_({.title = "Codotaku Workspace", .width = 1024, .height = 768}) {
         auto base_path = SDL_GetBasePath();
-        auto font_path = std::format("{}{}", base_path, "assets/fonts/Inter_18pt-Regular.ttf");
-        font_ = chk(TTF_OpenFont(font_path.c_str(), 16));
+        const auto font_path = std::format("{}{}", base_path, "assets/fonts/Inter_18pt-Regular.ttf");
+        font_ = chk(TTF_OpenFont(font_path.c_str(), 14));
 
         config_ = YGConfigNew();
+        const auto pixelsInPoint = chk(SDL_GetWindowDisplayScale(ctx_.window()));
         YGConfigSetPointScaleFactor(config_, pixelsInPoint);
+        YGConfigSetUseWebDefaults(config_, true);
 
-        // 1. Create the Root Node (fills the viewport canvas background)
-        root_ = CreateWidget(nullptr, Widget{.color = {0.1f, 0.1f, 0.12f, 1.0f}}, [this](YGNodeRef node) {
-            YGNodeStyleSetFlexDirection(node, YGFlexDirectionRow);
-            YGNodeStyleSetWidth(node, windowWidth);
-            YGNodeStyleSetHeight(node, windowHeight);
-            YGNodeStyleSetPadding(node, YGEdgeAll, 16.0f);
+        // --- Root Canvas Window ---
+        root_ = CreateContainer(nullptr, SDL_FColor{0.08f, 0.09f, 0.11f, 1.0f}, false, nullptr, [this](YGNodeRef node) {
+            StyleBuilder(node)
+                    .flexDirection(YGFlexDirectionColumn)
+                    .width(ctx_.width())
+                    .height(ctx_.height())
+                    .padding(YGEdgeAll, 20.0f);
         });
 
-        // 2. Create a Sidebar Node
-        auto sidebar = CreateWidget(root_, Widget{.color = {0.15f, 0.15f, 0.18f, 1.0f}}, [](YGNodeRef node) {
-            YGNodeStyleSetWidth(node, 240.0f);
-            YGNodeStyleSetHeightPercent(node, 100.0f);
-            YGNodeStyleSetMargin(node, YGEdgeRight, 16.0f);
-            YGNodeStyleSetPadding(node, YGEdgeAll, 12.0f);
-            YGNodeStyleSetFlexDirection(node, YGFlexDirectionColumn);
-        });
+        // --- Header Block Container ---
+        const auto header = CreateContainer(root_, SDL_FColor{0.13f, 0.15f, 0.19f, 1.0f}, false, nullptr,
+                                            [](YGNodeRef node) {
+                                                StyleBuilder(node)
+                                                        .flexDirection(YGFlexDirectionRow)
+                                                        .widthPercent(100.0f)
+                                                        .height(60.0f)
+                                                        .padding(YGEdgeHorizontal, 16.0f)
+                                                        .alignItems(YGAlignCenter)
+                                                        .justifyContent(YGJustifySpaceBetween)
+                                                        .margin(YGEdgeBottom, 20.0f);
+                                            });
+        CreateTextWidget(header, "WORKSPACE CONSOLE");
 
-        // Sidebar Header Title (Transparent background)
-        CreateTextWidget(sidebar, "DASHBOARD", SDL_FColor{0.0f, 0.0f, 0.0f, 0.0f}, [](YGNodeRef node) {
-            YGNodeStyleSetMargin(node, YGEdgeBottom, 24.0f);
-            YGNodeStyleSetMargin(node, YGEdgeLeft, 8.0f);
-        });
+        const auto liveBadge = CreateContainer(header, SDL_FColor{0.18f, 0.45f, 0.23f, 1.0f}, false, nullptr,
+                                               [](YGNodeRef node) {
+                                                   StyleBuilder(node)
+                                                           .padding(YGEdgeHorizontal, 12.0f)
+                                                           .padding(YGEdgeVertical, 6.0f);
+                                               });
+        CreateTextWidget(liveBadge, "ONLINE");
 
-        // Interactive Sidebar Navigation Links
-        const std::array<const char *, 3> navItems = {"Overview", "Analytics", "Settings"};
-        for (const auto *item: navItems) {
-            CreateTextWidget(sidebar, item, SDL_FColor{0.2f, 0.22f, 0.28f, 1.0f}, [](YGNodeRef node) {
-                YGNodeStyleSetHeight(node, 40.0f);
-                YGNodeStyleSetWidthPercent(node, 100.0f);
-                YGNodeStyleSetMargin(node, YGEdgeBottom, 8.0f);
-                YGNodeStyleSetPadding(node, YGEdgeLeft, 12.0f);
-                YGNodeStyleSetAlignItems(node, YGAlignCenter);
-                YGNodeStyleSetJustifyContent(node, YGJustifyCenter);
-            });
+        // --- Grid Matrix Row ---
+        const auto gridRow = CreateContainer(root_, SDL_FColor{0.0f, 0.0f, 0.0f, 0.0f}, false, nullptr,
+                                             [](YGNodeRef node) {
+                                                 StyleBuilder(node)
+                                                         .flexDirection(YGFlexDirectionRow)
+                                                         .widthPercent(100.0f)
+                                                         .gap(YGGutterAll, 16.0f)
+                                                         .margin(YGEdgeBottom, 20.0f);
+                                             });
+
+        constexpr std::array metrics = {
+            std::make_pair("Engine State", "Active / 60 FPS"),
+            std::make_pair("Memory Heap", "Arena Balanced"),
+            std::make_pair("Active Threads", "4 Cores allocated")
+        };
+
+        for (const auto &[title, data]: metrics) {
+            const auto card = CreateContainer(gridRow, SDL_FColor{0.13f, 0.15f, 0.19f, 1.0f}, false, nullptr,
+                                              [](YGNodeRef node) {
+                                                  StyleBuilder(node)
+                                                          .flexGrow(1.0f)
+                                                          .flexBasis(0.0f)
+                                                          .padding(YGEdgeAll, 16.0f)
+                                                          .flexDirection(YGFlexDirectionColumn)
+                                                          .gap(YGGutterAll, 4.0f);
+                                              });
+            CreateTextWidget(card, title);
+            CreateTextWidget(card, data);
         }
 
-        // 3. Create Main Content Area (Vertical Stack)
-        auto mainContent = CreateWidget(root_, Widget{.color = {0.12f, 0.12f, 0.15f, 1.0f}}, [](YGNodeRef node) {
-            YGNodeStyleSetFlexGrow(node, 1.0f);
-            YGNodeStyleSetHeightPercent(node, 100.0f);
-            YGNodeStyleSetPadding(node, YGEdgeAll, 24.0f);
-            YGNodeStyleSetFlexDirection(node, YGFlexDirectionColumn);
-        });
+        // --- Dynamic View Split ---
+        const auto mainSplit = CreateContainer(root_, SDL_FColor{0.0f, 0.0f, 0.0f, 0.0f}, false, nullptr,
+                                               [](YGNodeRef node) {
+                                                   StyleBuilder(node)
+                                                           .flexDirection(YGFlexDirectionRow)
+                                                           .widthPercent(100.0f)
+                                                           .flexGrow(1.0f)
+                                                           .gap(YGGutterAll, 16.0f);
+                                               });
 
-        // Main View Title Heading
-        CreateTextWidget(mainContent, "System Settings", SDL_FColor{0.0f, 0.0f, 0.0f, 0.0f}, [](YGNodeRef node) {
-            YGNodeStyleSetMargin(node, YGEdgeBottom, 16.0f);
-        });
+        // Left Container Block: Logs Area
+        const auto logsPane = CreateContainer(mainSplit, SDL_FColor{0.13f, 0.15f, 0.19f, 1.0f}, false, nullptr,
+                                              [](YGNodeRef node) {
+                                                  StyleBuilder(node)
+                                                          .flexGrow(2.0f)
+                                                          .flexBasis(0.0f)
+                                                          .padding(YGEdgeAll, 20.0f)
+                                                          .flexDirection(YGFlexDirectionColumn)
+                                                          .gap(YGGutterAll, 12.0f);
+                                              });
+        CreateTextWidget(logsPane, "System Feed Logs");
+        CreateTextWidget(
+            logsPane,
+            ">> Pure leaf components isolated successfully.\n>> Parent containers processing alignment properties independently.\n>> UI compilation complete.");
 
-        // Content Card demonstrating Multi-line Auto-Wrapping text managed by Yoga
-        auto card = CreateWidget(mainContent, Widget{.color = {0.18f, 0.18f, 0.22f, 1.0f}}, [](YGNodeRef node) {
-            YGNodeStyleSetWidthPercent(node, 100.0f);
-            YGNodeStyleSetPadding(node, YGEdgeAll, 16.0f);
-            YGNodeStyleSetMargin(node, YGEdgeBottom, 20.0f);
-            YGNodeStyleSetFlexDirection(node, YGFlexDirectionColumn);
-        });
+        // Right Container Block: Action Control Group
+        const auto controlPane = CreateContainer(mainSplit, SDL_FColor{0.11f, 0.12f, 0.15f, 1.0f}, false, nullptr,
+                                                 [](YGNodeRef node) {
+                                                     StyleBuilder(node)
+                                                             .flexGrow(1.0f)
+                                                             .flexBasis(0.0f)
+                                                             .padding(YGEdgeAll, 16.0f)
+                                                             .flexDirection(YGFlexDirectionColumn)
+                                                             .gap(YGGutterAll, 12.0f);
+                                                 });
+        CreateTextWidget(controlPane, "Actions Console");
 
-        const char *longParagraph =
-                "Yoga is dynamically calculating layout bounds, passing maximum widths to our text widget, "
-                "and forcing lines to auto-wrap into clean paragraph boxes when boundaries push up against the canvas container edge. "
-                "Click any structural layout block to toggle its color asset context instantly.";
+        // Action 1
+        const auto btnSync = CreateContainer(controlPane, SDL_FColor{0.22f, 0.25f, 0.32f, 1.0f}, true,
+                                             []() { SDL_Log("Synchronizing Core Thread Channels..."); },
+                                             [](YGNodeRef node) {
+                                                 StyleBuilder(node)
+                                                         .widthPercent(100.0f)
+                                                         .height(44.0f)
+                                                         .padding(YGEdgeLeft, 16.0f)
+                                                         .alignItems(YGAlignCenter)
+                                                         .justifyContent(YGJustifyFlexStart);
+                                             });
+        CreateTextWidget(btnSync, "Synchronize Thread");
 
-        CreateTextWidget(card, longParagraph, SDL_FColor{0.0f, 0.0f, 0.0f, 0.0f}, [](YGNodeRef node) {
-            YGNodeStyleSetWidthPercent(node, 100.0f);
-        });
+        // Action 2
+        const auto btnReset = CreateContainer(controlPane, SDL_FColor{0.22f, 0.25f, 0.32f, 1.0f}, true,
+                                              []() { SDL_Log("Resetting Core Engine Layout Tree..."); },
+                                              [](YGNodeRef node) {
+                                                  StyleBuilder(node)
+                                                          .widthPercent(100.0f)
+                                                          .height(44.0f)
+                                                          .padding(YGEdgeLeft, 16.0f)
+                                                          .alignItems(YGAlignCenter)
+                                                          .justifyContent(YGJustifyFlexStart);
+                                              });
+        CreateTextWidget(btnReset, "Reset Core Layout");
 
-        // Action Footer Area containing layout control buttons side-by-side
-        auto footer = CreateWidget(mainContent, Widget{.color = {0.0f, 0.0f, 0.0f, 0.0f}}, [](YGNodeRef node) {
-            YGNodeStyleSetFlexDirection(node, YGFlexDirectionRow);
-            YGNodeStyleSetWidthPercent(node, 100.0f);
-        });
-
-        CreateTextWidget(footer, "Save Changes", SDL_FColor{0.25f, 0.45f, 0.35f, 1.0f}, [](YGNodeRef node) {
-            YGNodeStyleSetPadding(node, YGEdgeHorizontal, 20.0f);
-            YGNodeStyleSetHeight(node, 40.0f);
-            YGNodeStyleSetMargin(node, YGEdgeRight, 12.0f);
-        });
-
-        CreateTextWidget(footer, "Cancel", SDL_FColor{0.35f, 0.2f, 0.25f, 1.0f}, [](YGNodeRef node) {
-            YGNodeStyleSetPadding(node, YGEdgeHorizontal, 20.0f);
-            YGNodeStyleSetHeight(node, 40.0f);
-        });
-
-        chk(SDL_ShowWindow(window_));
+        ctx_.Show();
     }
 
-    auto CreateWidget(YGNodeRef parent, Widget widget, auto &&styling_callback) -> YGNodeRef {
+    auto CreateContainer(YGNodeRef parent, SDL_FColor color, bool interactive, std::move_only_function<void()> onClick,
+                         auto &&styling_callback) -> YGNodeRef {
         auto node = YGNodeNewWithConfig(config_);
+        Widget *allocated = widget_allocator_.new_object<Widget>(Widget{
+            .type = Widget::Type::Container,
+            .color = color,
+            .text = nullptr,
+            .hovered = false,
+            .interactive = interactive,
+            .onClick = std::move(onClick)
+        });
+        YGNodeSetContext(node, allocated);
 
-        Widget *allocated_widget = widget_allocator_.new_object<Widget>(std::move(widget));
-        YGNodeSetContext(node, allocated_widget);
+        if (parent) {
+            YGNodeInsertChild(parent, node, YGNodeGetChildCount(parent));
+        }
+        styling_callback(node);
+        return node;
+    }
+
+    auto CreateTextWidget(YGNodeRef parent, const char *content) -> YGNodeRef {
+        const auto node = YGNodeNewWithConfig(config_);
+        TTF_Text *textObj = chk(TTF_CreateText(ctx_.textEngine(), font_, content, 0));
+
+        Widget *allocated = widget_allocator_.new_object<Widget>(Widget{
+            .type = Widget::Type::Text,
+            .color = {0.0f, 0.0f, 0.0f, 0.0f},
+            .text = textObj,
+            .hovered = false,
+            .interactive = false,
+            .onClick = nullptr
+        });
+        YGNodeSetContext(node, allocated);
 
         if (parent) {
             YGNodeInsertChild(parent, node, YGNodeGetChildCount(parent));
         }
 
-        styling_callback(node);
-        return node;
-    }
-
-    auto CreateTextWidget(YGNodeRef parent, const char *content, SDL_FColor color,
-                          auto &&styling_callback) -> YGNodeRef {
-        TTF_Text *textObj = chk(TTF_CreateText(textEngine_, font_, content, 0));
-
-        auto node = CreateWidget(parent, Widget{.color = color, .text = textObj},
-                                 std::forward<decltype(styling_callback)>(styling_callback));
-
-        // Wire up Yoga measuring mechanics so it knows how big this text block is
         YGNodeSetMeasureFunc(node, MeasureTextNode);
         return node;
     }
@@ -171,23 +229,29 @@ public:
     void RenderNode(YGNodeRef node, float parentX, float parentY) {
         if (!node) return;
 
-        // Calculate absolute coordinates inside the window viewport
-        float absX = parentX + YGNodeLayoutGetLeft(node);
-        float absY = parentY + YGNodeLayoutGetTop(node);
-        float width = YGNodeLayoutGetWidth(node);
-        float height = YGNodeLayoutGetHeight(node);
+        const float absX = parentX + YGNodeLayoutGetLeft(node);
+        const float absY = parentY + YGNodeLayoutGetTop(node);
+        const float width = YGNodeLayoutGetWidth(node);
+        const float height = YGNodeLayoutGetHeight(node);
 
-        auto *widget = static_cast<Widget *>(YGNodeGetContext(node));
-        if (widget) {
-            SDL_FRect rect{absX, absY, width, height};
-            chk(SDL_SetRenderDrawColorFloat(renderer_, widget->color.r, widget->color.g, widget->color.b,
-                                            widget->color.a));
-            chk(SDL_RenderFillRect(renderer_, &rect));
+        if (const auto *widget = static_cast<Widget *>(YGNodeGetContext(node))) {
+            if (widget->type == Widget::Type::Container) {
+                const SDL_FRect rect{absX, absY, width, height};
 
-            if (widget->text) {
-                chk(TTF_SetTextColorFloat(widget->text, 1.0f, 1.0f, 1.0f, 1.0f)); // White text
-                chk(TTF_SetTextPosition(widget->text, static_cast<int>(absX), static_cast<int>(absY)));
-                chk(TTF_DrawRendererText(widget->text, 0, 0)); // Draws using absolute position internal state
+                SDL_FColor renderColor = widget->color;
+                if (widget->hovered && widget->color.a > 0.0f) {
+                    renderColor.r = std::min(renderColor.r + 0.06f, 1.0f);
+                    renderColor.g = std::min(renderColor.g + 0.06f, 1.0f);
+                    renderColor.b = std::min(renderColor.b + 0.06f, 1.0f);
+                }
+
+                chk(SDL_SetRenderDrawColorFloat(ctx_.renderer(), renderColor.r, renderColor.g, renderColor.b,
+                                                renderColor.a));
+                chk(SDL_RenderFillRect(ctx_.renderer(), &rect));
+            } else if (widget->type == Widget::Type::Text && widget->text) {
+                chk(TTF_SetTextWrapWidth(widget->text, static_cast<int>(width)));
+                chk(TTF_SetTextColorFloat(widget->text, 0.9f, 0.92f, 0.95f, 1.0f));
+                chk(TTF_DrawRendererText(widget->text, absX, absY));
             }
         }
 
@@ -197,51 +261,63 @@ public:
         }
     }
 
-    auto HitTest(YGNodeRef node, float parentX, float parentY, float mouseX, float mouseY) -> YGNodeRef {
+    static auto HitTest(YGNodeRef node, float parentX, float parentY, float mouseX, float mouseY) -> YGNodeRef {
         if (!node) return nullptr;
 
-        // Calculate absolute bounds for this node
-        float absX = parentX + YGNodeLayoutGetLeft(node);
-        float absY = parentY + YGNodeLayoutGetTop(node);
-        float width = YGNodeLayoutGetWidth(node);
-        float height = YGNodeLayoutGetHeight(node);
+        const float absX = parentX + YGNodeLayoutGetLeft(node);
+        const float absY = parentY + YGNodeLayoutGetTop(node);
+        const float width = YGNodeLayoutGetWidth(node);
+        const float height = YGNodeLayoutGetHeight(node);
 
-        // Check if mouse is inside this node's bounding box
-        bool inside = (mouseX >= absX && mouseX <= absX + width &&
-                       mouseY >= absY && mouseY <= absY + height);
+        const SDL_FPoint mousePoint{mouseX, mouseY};
+        const SDL_FRect nodeRect{absX, absY, width, height};
 
-        if (!inside) return nullptr;
+        if (!SDL_PointInRectFloat(&mousePoint, &nodeRect)) return nullptr;
 
-        // Search children in reverse order (top-most visual elements first)
-        int32_t childCount = static_cast<int32_t>(YGNodeGetChildCount(node));
+        const int32_t childCount = static_cast<int32_t>(YGNodeGetChildCount(node));
         for (int32_t i = childCount - 1; i >= 0; --i) {
-            auto hit = HitTest(YGNodeGetChild(node, i), absX, absY, mouseX, mouseY);
-            if (hit) return hit; // Return the deeply nested child if hit
+            if (const auto hit = HitTest(YGNodeGetChild(node, i), absX, absY, mouseX, mouseY)) return hit;
         }
 
-        // If inside this node but no child was hit, this node is the target
-        return node;
+        if (const auto *widget = static_cast<Widget *>(YGNodeGetContext(node));
+            widget && widget->type == Widget::Type::Container && widget->interactive) {
+            return node;
+        }
+        return nullptr;
+    }
+
+    void UpdateHoverState(YGNodeRef node, YGNodeRef hoveredNode) {
+        if (!node) return;
+
+        if (auto *widget = static_cast<Widget *>(YGNodeGetContext(node))) {
+            widget->hovered = (node == hoveredNode);
+        }
+
+        const uint32_t childCount = YGNodeGetChildCount(node);
+        for (uint32_t i = 0; i < childCount; ++i) {
+            UpdateHoverState(YGNodeGetChild(node, i), hoveredNode);
+        }
     }
 
     ~App() {
         YGNodeFreeRecursive(root_);
+        if (config_) YGConfigFree(config_);
         if (font_) TTF_CloseFont(font_);
-        if (textEngine_) TTF_DestroyRendererTextEngine(textEngine_);
-        TTF_Quit();
     }
 
-    auto Event(SDL_Event *event) -> SDL_AppResult {
+    auto Event(const SDL_Event *event) -> SDL_AppResult {
         switch (event->type) {
+            case SDL_EVENT_MOUSE_MOTION: {
+                const auto hitNode = HitTest(root_, 0.0f, 0.0f, event->motion.x, event->motion.y);
+                UpdateHoverState(root_, hitNode);
+                return SDL_APP_CONTINUE;
+            }
             case SDL_EVENT_MOUSE_BUTTON_DOWN: {
                 if (event->button.button == SDL_BUTTON_LEFT) {
-                    auto hitNode = HitTest(root_, 0.0f, 0.0f, event->button.x, event->button.y);
-                    if (hitNode) {
-                        auto *widget = static_cast<Widget *>(YGNodeGetContext(hitNode));
-                        if (widget) {
-                            // Quick test: invert color on click to prove it works
-                            widget->color.r = 1.0f - widget->color.r;
-                            widget->color.g = 1.0f - widget->color.g;
-                            widget->color.b = 1.0f - widget->color.b;
+                    if (const auto hitNode = HitTest(root_, 0.0f, 0.0f, event->button.x, event->button.y)) {
+                        if (auto *widget = static_cast<Widget *>(YGNodeGetContext(hitNode));
+                            widget && widget->onClick) {
+                            widget->onClick();
                         }
                     }
                 }
@@ -250,13 +326,15 @@ public:
             case SDL_EVENT_QUIT:
                 return SDL_APP_SUCCESS;
             case SDL_EVENT_WINDOW_DISPLAY_SCALE_CHANGED: {
-                const auto pixelsInPoint = chk(SDL_GetWindowDisplayScale(window_));
+                const auto pixelsInPoint = chk(SDL_GetWindowDisplayScale(ctx_.window()));
                 YGConfigSetPointScaleFactor(config_, pixelsInPoint);
+                return SDL_APP_CONTINUE;
             }
             case SDL_EVENT_WINDOW_RESIZED:
-                chk(SDL_GetWindowSize(window_, &windowWidth, &windowHeight));
-                YGNodeStyleSetWidth(root_, windowWidth);
-                YGNodeStyleSetHeight(root_, windowHeight);
+                ctx_.SyncDimensions();
+                StyleBuilder(root_)
+                        .width(ctx_.width())
+                        .height(ctx_.height());
                 return SDL_APP_CONTINUE;
             default:
                 return SDL_APP_CONTINUE;
@@ -264,25 +342,18 @@ public:
     }
 
     auto Iterate() -> SDL_AppResult {
-        YGNodeCalculateLayout(root_, windowWidth, windowHeight, YGDirectionLTR);
-        chk(SDL_SetRenderDrawColorFloat(renderer_, 1.0, 0.0, 0.0, 1.0));
-        chk(SDL_RenderClear(renderer_));
+        YGNodeCalculateLayout(root_, ctx_.width(), ctx_.height(), YGDirectionLTR);
+        ctx_.Clear({0.05f, 0.05f, 0.06f, 1.0f});
         RenderNode(root_, 0, 0);
-        chk(SDL_RenderPresent(renderer_));
+        ctx_.Present();
         return SDL_APP_CONTINUE;
     }
 
-private
-:
+private:
     SDLLogRedirector logger_redirector_;
-    SDL_Window *window_;
-    SDL_Renderer *renderer_;
-    TTF_TextEngine *textEngine_;
+    WindowContext ctx_;
 
     TTF_Font *font_;
-
-    int windowWidth, windowHeight;
-
     YGConfigRef config_;
     YGNodeRef root_;
 
